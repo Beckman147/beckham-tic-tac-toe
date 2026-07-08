@@ -1,0 +1,10 @@
+# Local preview / editor scaffolding (not part of the deployed site)
+.claude/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/
