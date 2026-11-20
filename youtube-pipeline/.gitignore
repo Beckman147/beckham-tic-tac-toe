@@ -1,0 +1,21 @@
+# Secrets - never commit these
+client_secret*.json
+token.json
+
+# Your upload history (keep it locally; deleting it causes re-uploads)
+uploaded.json
+uploaded.json.tmp
+
+# Footage and renders
+*.mp4
+*.webm
+*.mkv
+*.mov
+*.m4v
+clips_in/
+shorts_out/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
