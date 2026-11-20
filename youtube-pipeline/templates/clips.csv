@@ -1,4 +1,4 @@
-filename,start,end,hook
-example_clip_01.mp4,00:00:12,00:00:31,1v3 with 20 HP
-example_clip_02.mp4,0:45,1:02,Day 4: pistols only
-example_clip_03.mp4,,,
+filename,start,end,hook,end_card
+example_clip_01.mp4,00:00:12,00:00:21,Plat 1 air dribble,
+example_clip_02.mp4,0:45,0:53,Ground pinch from a Plat 1,sub for more pinches
+example_clip_03.mp4,,,,none

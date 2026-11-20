@@ -85,7 +85,7 @@ cd C:\path\to\youtube-pipeline
 
 # 1. Copy templates\clips.csv to C:\yt\clips.csv and list your best moments
 #    (filename, start, end, hook text). Then build the Shorts:
-py make_shorts.py --input C:\yt\clips_in --output C:\yt\shorts_out --manifest C:\yt\clips.csv
+py make_shorts.py --input C:\yt\clips_in --output C:\yt\shorts_out --manifest C:\yt\clips.csv --end-card "worth a sub?"
 
 # 2. Watch the results in C:\yt\shorts_out. Not happy with the framing? Try
 #    --mode crop or --mode fit (default is zoom).

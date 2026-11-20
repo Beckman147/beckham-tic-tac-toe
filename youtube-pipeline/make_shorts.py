@@ -16,14 +16,18 @@ Usage:
   python make_shorts.py --input clips_in --output shorts_out
   python make_shorts.py --input clips_in --output shorts_out --manifest clips.csv
   python make_shorts.py --input clips_in --output shorts_out --mode fit --max-dur 30
+  python make_shorts.py --input clips_in --output shorts_out --end-card "worth a sub?"
 
 Manifest (CSV, header required). Only 'filename' is mandatory:
-  filename,start,end,hook
-  cod_clip_01.mp4,00:00:12,00:00:33,4 kills with the wrong gun
-  apex_clip_07.webm,,,Nobody saw this coming
+  filename,start,end,hook,end_card
+  rl_clip_01.mp4,00:00:12,00:00:21,Plat 1 air dribble,
+  rl_clip_02.mp4,,,Ground pinch from a Plat 1,sub for more pinches
+  rl_clip_03.mp4,,,,none
 
   start/end  ffmpeg timestamps (HH:MM:SS or seconds). Blank = clip start/end.
   hook       text burned across the top. Blank = no text.
+  end_card   text shown over the last moments of this clip. Blank = use
+             --end-card. 'none' = no end card on this clip.
 
 Requires ffmpeg + ffprobe on PATH. Python 3.8+. No third-party packages.
 """
@@ -38,6 +42,9 @@ import sys
 import tempfile
 
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".m4v"}
+
+# Values in the manifest's end_card column that switch the card off for a clip.
+NO_CARD = {"none", "off", "-", "no"}
 
 # Vertical canvas. 1080x1920 is the Shorts native frame.
 OUT_W, OUT_H = 1080, 1920
@@ -159,51 +166,74 @@ def parse_ts(value):
     return secs
 
 
-def wrap_hook(text, max_lines=3):
+def wrap_hook(text, max_lines=3, sizes=(84, 76, 68, 60, 52), margin=70,
+              truncate=True):
     """
     Wrap hook text to fit the 1080px canvas. drawtext never wraps on its own, so
     an unwrapped hook overflows and loses its first and last words off-screen.
 
     Picks the largest font size whose wrapped result fits in max_lines.
-    Returns (wrapped_text, fontsize).
+    Returns (wrapped_text, fontsize), or (None, None) when it doesn't fit and
+    truncate is False.
     """
     import textwrap
 
-    usable = OUT_W - 2 * 70          # side margins
+    usable = OUT_W - 2 * margin      # side margins
     # Bold sans glyphs average ~0.58 x fontsize wide; 0.62 leaves headroom for
     # wide characters (W, M, digits) so lines don't clip at the edges.
     char_w = 0.62
-    for size in (84, 76, 68, 60, 52):
+    for size in sizes:
         per_line = max(8, int(usable / (char_w * size)))
         lines = textwrap.wrap(text, width=per_line, break_long_words=True)
         if len(lines) <= max_lines:
             return "\n".join(lines), size
+    if not truncate:
+        return None, None
     # Still too long at the smallest size: keep the first max_lines and mark it.
-    size = 52
+    size = sizes[-1]
     per_line = max(8, int(usable / (char_w * size)))
     lines = textwrap.wrap(text, width=per_line, break_long_words=True)[:max_lines]
     lines[-1] = lines[-1].rstrip(" .,;:") + "..."
     return "\n".join(lines), size
 
 
-def build_video_filter(mode, hook, font, hook_file, fontsize=72):
+def build_video_filter(mode, font, hook_file=None, fontsize=72,
+                       card_file=None, card_size=96, card_start=None):
     """
     Build the video filter chain.
 
     Returns (filter_string, uses_complex). 'fit' and 'zoom' need filter_complex
     because they composite the gameplay over a blurred copy of itself.
     """
+    # Text goes in via textfile= so drawtext never has to parse it: hooks often
+    # carry apostrophes, colons and commas that would otherwise break the graph.
     draw = ""
-    if hook and font:
-        # textfile= avoids escaping the hook text itself, which commonly carries
-        # apostrophes, colons and commas that would otherwise break the graph.
-        draw = (
+    if hook_file and font:
+        draw += (
             f",drawtext=fontfile='{ff_escape_path(font)}'"
             f":textfile='{ff_escape_path(hook_file)}'"
             f":fontcolor=white:fontsize={fontsize}:line_spacing=14"
             f":borderw=8:bordercolor=black@0.95"
             f":x=(w-text_w)/2:y=170"
             f":text_align=center"
+        )
+    if card_file and font and card_start is not None:
+        # Over the gameplay, a little above centre: the play is over by now,
+        # the bottom of the frame sits under YouTube's title and subscribe
+        # button, and the like/comment/share buttons run down the right edge
+        # from about halfway. Quick fade in so it doesn't pop. Frame timestamps start at 0 even after an
+        # input-side seek, so card_start is measured from the Short's start.
+        t0 = f"{card_start:.3f}"
+        draw += (
+            f",drawtext=fontfile='{ff_escape_path(font)}'"
+            f":textfile='{ff_escape_path(card_file)}'"
+            f":fontcolor=white:fontsize={card_size}:line_spacing=14"
+            f":borderw=6:bordercolor=black@0.95"
+            f":box=1:boxcolor=black@0.55:boxborderw=36"
+            f":x=(w-text_w)/2:y=h*0.42-text_h/2"
+            f":text_align=center"
+            f":enable='gte(t,{t0})'"
+            f":alpha='min(1,(t-{t0})/0.2)'"
         )
 
     if mode == "crop":
@@ -231,7 +261,7 @@ def build_video_filter(mode, hook, font, hook_file, fontsize=72):
 
 
 def convert(src, dst, mode, hook, font, max_dur, lufs, start, end,
-            crf, thumbs_dir, tmpdir, dry_run):
+            crf, thumbs_dir, tmpdir, dry_run, end_card="", end_card_secs=1.5):
     info = probe(src)
     if info is None:
         print(f"  skip (unreadable): {os.path.basename(src)}")
@@ -264,16 +294,46 @@ def convert(src, dst, mode, hook, font, max_dur, lufs, start, end,
     elif max_dur:
         length = max_dur
 
-    # Hook text goes to a sidecar file so drawtext never has to parse it.
+    def sidecar(text):
+        fd, path = tempfile.mkstemp(suffix=".txt", dir=tmpdir)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
     hook_file = None
     fontsize = 72
     if hook and font:
         wrapped, fontsize = wrap_hook(hook)
-        fd, hook_file = tempfile.mkstemp(suffix=".txt", dir=tmpdir)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(wrapped)
+        hook_file = sidecar(wrapped)
 
-    vf, complex_mode = build_video_filter(mode, hook, font, hook_file, fontsize)
+    # The end card is timed back from the end of the finished Short, so work
+    # out how long the output will actually be: the requested length, unless
+    # the source runs out first.
+    card_file, card_size, card_start = None, 96, None
+    if end_card and font:
+        remaining = (dur - (start_s or 0.0)) if dur else None
+        out_dur = length if length else remaining
+        if length and remaining:
+            out_dur = min(length, remaining)
+        if not out_dur or out_dur <= 0:
+            print(f"  note: length unknown, end card skipped: {label}")
+        else:
+            card_start = max(0.0, out_dur - end_card_secs)
+            # Wider side margins than the hook keep the card clear of the
+            # buttons YouTube overlays on the right. A short line like
+            # "worth a sub?" stays on one line if it fits at a good size;
+            # longer text wraps to two.
+            wrapped, card_size = wrap_hook(end_card, max_lines=1,
+                                           sizes=(110, 96, 84), margin=150,
+                                           truncate=False)
+            if wrapped is None:
+                wrapped, card_size = wrap_hook(end_card, max_lines=2,
+                                               sizes=(110, 96, 84, 72, 60),
+                                               margin=150)
+            card_file = sidecar(wrapped)
+
+    vf, complex_mode = build_video_filter(mode, font, hook_file, fontsize,
+                                          card_file, card_size, card_start)
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats"]
 
@@ -331,7 +391,7 @@ def convert(src, dst, mode, hook, font, max_dur, lufs, start, end,
 
 
 def load_manifest(path):
-    """Return {lowercased filename: {start, end, hook}}."""
+    """Return {lowercased filename: {start, end, hook, end_card}}."""
     rows = {}
     with open(path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
@@ -349,6 +409,7 @@ def load_manifest(path):
                 "start": row.get("start", ""),
                 "end": row.get("end", ""),
                 "hook": row.get("hook", ""),
+                "end_card": row.get("end_card", ""),
             }
     return rows
 
@@ -369,11 +430,17 @@ def main():
                     help="integrated loudness target (default: -14)")
     ap.add_argument("--crf", type=int, default=19,
                     help="x264 quality, lower is better (default: 19)")
-    ap.add_argument("--font", help="path to a bold .ttf for hook text")
+    ap.add_argument("--end-card", default="",
+                    help='text over the last moments of every Short, e.g. "worth a sub?"')
+    ap.add_argument("--end-card-secs", type=float, default=1.5,
+                    help="how long the end card shows, in seconds (default: 1.5)")
+    ap.add_argument("--font", help="path to a bold .ttf for on-screen text")
     ap.add_argument("--no-thumbs", action="store_true", help="skip thumbnail frames")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the ffmpeg commands without encoding")
     args = ap.parse_args()
+    if args.end_card_secs <= 0:
+        die("--end-card-secs must be more than 0")
 
     need_tool("ffmpeg")
     need_tool("ffprobe")
@@ -394,9 +461,11 @@ def main():
     manifest = load_manifest(args.manifest) if args.manifest else {}
 
     font = find_font(args.font)
-    wants_text = any(r["hook"] for r in manifest.values())
+    wants_text = bool(args.end_card) or any(
+        r["hook"] or (r["end_card"] and r["end_card"].lower() not in NO_CARD)
+        for r in manifest.values())
     if wants_text and not font:
-        print("warning: no bold font found, hook text will be skipped. "
+        print("warning: no bold font found, on-screen text will be skipped. "
               "Pass --font C:\\Windows\\Fonts\\arialbd.ttf", file=sys.stderr)
 
     clips = sorted(
@@ -427,6 +496,11 @@ def main():
             stem = os.path.splitext(name)[0]
             dst = os.path.join(out_dir, f"{stem}_short.mp4")
             row = manifest.get(name.lower(), {})
+            per_clip = row.get("end_card", "")
+            if per_clip.lower() in NO_CARD:
+                card = ""
+            else:
+                card = per_clip or args.end_card
             if convert(
                 src=src, dst=dst, mode=args.mode,
                 hook=row.get("hook", ""), font=font,
@@ -435,6 +509,7 @@ def main():
                 start=row.get("start", ""), end=row.get("end", ""),
                 crf=args.crf, thumbs_dir=thumbs_dir,
                 tmpdir=tmpdir, dry_run=args.dry_run,
+                end_card=card, end_card_secs=args.end_card_secs,
             ):
                 ok += 1
     finally:
