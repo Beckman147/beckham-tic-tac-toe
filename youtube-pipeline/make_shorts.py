@@ -2,8 +2,9 @@
 """
 make_shorts.py - Batch-convert PS5 gameplay captures into YouTube Shorts.
 
-Takes a folder of landscape PS5 clips and produces 1080x1920 vertical clips with
-loudness-normalized audio, an optional burned-in hook line, and a thumbnail frame.
+Takes a folder of landscape PS5 clips and produces 1080x1920 vertical clips at up
+to 60fps with loudness-normalized audio, an optional burned-in hook line, an
+optional end card, and a thumbnail frame.
 
 Three framing modes (try all three on one real clip before committing):
   crop  full-bleed centre crop. Biggest action, keeps only ~32% of the width, so
@@ -104,8 +105,17 @@ def ff_escape_path(path):
     return p
 
 
+def parse_rate(value):
+    """Parse an ffprobe frame rate like '60/1' or '60000/1001' into a float."""
+    try:
+        num, den = (float(x) for x in str(value).split("/"))
+    except (TypeError, ValueError):
+        return None
+    return num / den if num > 0 and den > 0 else None
+
+
 def probe(path):
-    """Return (duration_seconds, width, height, has_audio)."""
+    """Return (duration_seconds, width, height, has_audio, (fps, fps_string))."""
     out = subprocess.run(
         [
             "ffprobe", "-v", "error",
@@ -130,10 +140,16 @@ def probe(path):
 
     width = height = 0
     has_audio = False
+    rate = (None, None)
     for st in meta.get("streams", []):
         if st.get("codec_type") == "video" and not width:
             width = int(st.get("width") or 0)
             height = int(st.get("height") or 0)
+            for key in ("avg_frame_rate", "r_frame_rate"):
+                fps = parse_rate(st.get(key))
+                if fps:
+                    rate = (fps, st.get(key))
+                    break
             if not dur:
                 try:
                     dur = float(st.get("duration") or 0.0)
@@ -141,7 +157,7 @@ def probe(path):
                     pass
         elif st.get("codec_type") == "audio":
             has_audio = True
-    return dur, width, height, has_audio
+    return dur, width, height, has_audio, rate
 
 
 def parse_ts(value):
@@ -261,12 +277,13 @@ def build_video_filter(mode, font, hook_file=None, fontsize=72,
 
 
 def convert(src, dst, mode, hook, font, max_dur, lufs, start, end,
-            crf, thumbs_dir, tmpdir, dry_run, end_card="", end_card_secs=1.5):
+            crf, thumbs_dir, tmpdir, dry_run, end_card="", end_card_secs=1.5,
+            max_fps=60):
     info = probe(src)
     if info is None:
         print(f"  skip (unreadable): {os.path.basename(src)}")
         return False
-    dur, width, height, has_audio = info
+    dur, width, height, has_audio, (src_fps, src_rate) = info
     if not width or not height:
         print(f"  skip (no video stream): {os.path.basename(src)}")
         return False
@@ -335,6 +352,16 @@ def convert(src, dst, mode, hook, font, max_dur, lufs, start, end,
     vf, complex_mode = build_video_filter(mode, font, hook_file, fontsize,
                                           card_file, card_size, card_start)
 
+    # Keep the clip's own frame rate up to max_fps: PS5 captures are 60fps,
+    # and fast games look noticeably smoother at 60 than 30. A 30fps source
+    # stays 30 rather than getting duplicated frames.
+    if src_fps and src_fps <= max_fps + 0.01:
+        out_rate = src_rate
+        out_label = f"{src_fps:.4g}fps"
+    else:
+        out_rate = f"{max_fps:g}"
+        out_label = f"{max_fps:g}fps"
+
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats"]
 
     # -ss before -i seeks fast; -t after -i is the output length.
@@ -352,8 +379,9 @@ def convert(src, dst, mode, hook, font, max_dur, lufs, start, end,
     cmd += [
         "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
         "-pix_fmt", "yuv420p",
-        "-profile:v", "high", "-level", "4.1",
-        "-r", "30",
+        # Level 4.2 is the lowest H.264 level that covers 1080x1920 at 60fps.
+        "-profile:v", "high", "-level", "4.2",
+        "-r", out_rate,
         "-movflags", "+faststart",
     ]
 
@@ -371,7 +399,7 @@ def convert(src, dst, mode, hook, font, max_dur, lufs, start, end,
         print(f"            {' '.join(cmd)}")
         return True
 
-    print(f"  {label} ({width}x{height}, {dur:.1f}s) -> {os.path.basename(dst)}")
+    print(f"  {label} ({width}x{height}, {dur:.1f}s, {out_label}) -> {os.path.basename(dst)}")
     res = subprocess.run(cmd)
     if res.returncode != 0:
         print(f"  FAILED: {label}", file=sys.stderr)
@@ -428,6 +456,9 @@ def main():
                     help="hard cap in seconds when no end time given (default: 45; 0 disables)")
     ap.add_argument("--lufs", type=float, default=-14.0,
                     help="integrated loudness target (default: -14)")
+    ap.add_argument("--fps", type=float, default=60.0,
+                    help="maximum frame rate (default: 60). Clips recorded at a "
+                         "lower rate keep their own")
     ap.add_argument("--crf", type=int, default=19,
                     help="x264 quality, lower is better (default: 19)")
     ap.add_argument("--end-card", default="",
@@ -441,6 +472,8 @@ def main():
     args = ap.parse_args()
     if args.end_card_secs <= 0:
         die("--end-card-secs must be more than 0")
+    if args.fps <= 0:
+        die("--fps must be more than 0")
 
     need_tool("ffmpeg")
     need_tool("ffprobe")
@@ -510,6 +543,7 @@ def main():
                 crf=args.crf, thumbs_dir=thumbs_dir,
                 tmpdir=tmpdir, dry_run=args.dry_run,
                 end_card=card, end_card_secs=args.end_card_secs,
+                max_fps=args.fps,
             ):
                 ok += 1
     finally:

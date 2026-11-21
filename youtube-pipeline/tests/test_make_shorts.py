@@ -1,5 +1,6 @@
 """
-End-to-end checks for make_shorts.py: trim lengths and end-card timing.
+End-to-end checks for make_shorts.py: trim lengths, frame rate and end-card
+timing.
 
 Generates its own sample clips with ffmpeg, so it needs ffmpeg/ffprobe on PATH
 and nothing else.
@@ -43,6 +44,16 @@ def dur(path):
          "-of", "csv=p=0", path]).strip())
 
 
+def video_info(path):
+    """(frame rate string, H.264 level, decoded frame count) of the first video stream."""
+    out = subprocess.check_output(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+         "-show_entries", "stream=avg_frame_rate,level,nb_read_packets",
+         "-of", "default=noprint_wrappers=1", path], text=True)
+    info = dict(line.split("=", 1) for line in out.strip().splitlines())
+    return info["avg_frame_rate"], int(info["level"]), int(info["nb_read_packets"])
+
+
 def frame(path, t):
     """Tiny grayscale frame at time t, as raw bytes."""
     return subprocess.run(
@@ -71,17 +82,27 @@ def main():
         ff("-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=5",
            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
            os.path.join(inp, "silent.mp4"))
+        # PS5 captures are 60fps; some sources come in at NTSC 59.94.
+        ff("-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60:duration=6",
+           "-f", "lavfi", "-i", "sine=frequency=330:duration=6",
+           "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-shortest", os.path.join(inp, "fast60.mp4"))
+        ff("-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60000/1001:duration=4",
+           "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+           os.path.join(inp, "ntsc.mp4"))
 
         card_csv = os.path.join(work, "card.csv")
         base_csv = os.path.join(work, "base.csv")
         with open(card_csv, "w") as fh:
             fh.write("filename,start,end,hook,end_card\n"
                      "long.mp4,3,15,Plat 1 air dribble,\n"
-                     "silent.mp4,,,,none\n")
+                     "silent.mp4,,,,none\n"
+                     "fast60.mp4,,,,\n")
         with open(base_csv, "w") as fh:
             fh.write("filename,start,end,hook\n"
                      "long.mp4,3,15,Plat 1 air dribble\n"
-                     "silent.mp4,,,\n")
+                     "silent.mp4,,,\n"
+                     "fast60.mp4,,,\n")
 
         print("trimmed clip (start 3s, end 15s) with the default end card")
         c, b = os.path.join(work, "card"), os.path.join(work, "base")
@@ -94,6 +115,28 @@ def main():
         check("no card 0.4s before it's due", diff(cp, bp, t0 - 0.4) < 0.5)
         check("card shows 0.6s after it's due", diff(cp, bp, t0 + 0.6) > 3)
         check("no card early in the Short", diff(cp, bp, 1.0) < 0.5)
+
+        print("frame rate")
+        rate, level, frames = video_info(os.path.join(b, "fast60_short.mp4"))
+        check("60fps clip stays 60fps", rate == "60/1", f"({rate})")
+        check("every frame kept (6s x 60 = 360)", abs(frames - 360) <= 2, f"({frames})")
+        check("labelled H.264 level 4.2", level == 42, f"(level {level})")
+        rate, _, frames = video_info(os.path.join(b, "long_short.mp4"))
+        check("30fps clip stays 30fps, no duplicate frames", rate == "30/1" and abs(frames - 360) <= 2,
+              f"({rate}, {frames} frames for 12s)")
+        fp, fb = os.path.join(c, "fast60_short.mp4"), os.path.join(b, "fast60_short.mp4")
+        t0 = dur(fp) - 1.5
+        check("end card timing holds at 60fps",
+              diff(fp, fb, t0 - 0.4) < 0.5 and diff(fp, fb, t0 + 0.6) > 3)
+        n = os.path.join(work, "ntsc")
+        mk(inp, n)
+        rate, _, _ = video_info(os.path.join(n, "ntsc_short.mp4"))
+        check("59.94fps clip keeps its exact rate", rate == "60000/1001", f"({rate})")
+        capped = os.path.join(work, "fps30")
+        mk(inp, capped, "--fps", "30")
+        rate, _, frames = video_info(os.path.join(capped, "fast60_short.mp4"))
+        check("--fps 30 caps a 60fps clip", rate == "30/1" and abs(frames - 180) <= 2,
+              f"({rate}, {frames} frames)")
 
         print("'none' in the end_card column")
         sp, sb = os.path.join(c, "silent_short.mp4"), os.path.join(b, "silent_short.mp4")
