@@ -83,6 +83,10 @@ that happens the script just opens the browser again. That's normal.
 ```powershell
 cd C:\path\to\youtube-pipeline
 
+# 0. Not sure what's in your clips? Let the scout find the highlights first,
+#    then use C:\yt\scout\clips.csv as your list in step 1:
+py find_moments.py --input C:\yt\clips_in --output C:\yt\scout
+
 # 1. Copy templates\clips.csv to C:\yt\clips.csv and list your best moments
 #    (filename, start, end, hook text). Then build the Shorts:
 py make_shorts.py --input C:\yt\clips_in --output C:\yt\shorts_out --manifest C:\yt\clips.csv --end-card "worth a sub?"

@@ -30,6 +30,9 @@ Manifest (CSV, header required). Only 'filename' is mandatory:
   end_card   text shown over the last moments of this clip. Blank = use
              --end-card. 'none' = no end card on this clip.
 
+  A clip can appear on several rows to cut several Shorts from it. Those come
+  out as name_short_1.mp4, name_short_2.mp4, ... in row order.
+
 Requires ffmpeg + ffprobe on PATH. Python 3.8+. No third-party packages.
 """
 
@@ -419,8 +422,8 @@ def convert(src, dst, mode, hook, font, max_dur, lufs, start, end,
 
 
 def load_manifest(path):
-    """Return {lowercased filename: {start, end, hook, end_card}}."""
-    rows = {}
+    """Return the manifest rows in order: [{filename, start, end, hook, end_card}]."""
+    rows = []
     with open(path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         if not reader.fieldnames or "filename" not in [
@@ -433,12 +436,13 @@ def load_manifest(path):
             name = row.get("filename", "")
             if not name:
                 continue
-            rows[name.lower()] = {
+            rows.append({
+                "filename": name,
                 "start": row.get("start", ""),
                 "end": row.get("end", ""),
                 "hook": row.get("hook", ""),
                 "end_card": row.get("end_card", ""),
-            }
+            })
     return rows
 
 
@@ -491,12 +495,12 @@ def main():
         thumbs_dir = os.path.join(out_dir, "thumbs")
         os.makedirs(thumbs_dir, exist_ok=True)
 
-    manifest = load_manifest(args.manifest) if args.manifest else {}
+    manifest = load_manifest(args.manifest) if args.manifest else []
 
     font = find_font(args.font)
     wants_text = bool(args.end_card) or any(
         r["hook"] or (r["end_card"] and r["end_card"].lower() not in NO_CARD)
-        for r in manifest.values())
+        for r in manifest)
     if wants_text and not font:
         print("warning: no bold font found, on-screen text will be skipped. "
               "Pass --font C:\\Windows\\Fonts\\arialbd.ttf", file=sys.stderr)
@@ -509,26 +513,45 @@ def main():
     if not clips:
         die(f"no video files in {in_dir} (looked for {', '.join(sorted(VIDEO_EXTS))})")
 
-    # A manifest acts as a whitelist: only listed clips get built.
+    # Each job is (source file, manifest row, output name). A manifest acts as
+    # a whitelist: only listed clips get built, once per row.
     if manifest:
-        clips = [c for c in clips if c.lower() in manifest]
-        missing = set(manifest) - {c.lower() for c in clips}
+        by_name = {c.lower(): c for c in clips}
+        per_file = {}
+        for r in manifest:
+            per_file[r["filename"].lower()] = per_file.get(r["filename"].lower(), 0) + 1
+        seen, jobs, missing = {}, [], set()
+        for r in manifest:
+            key = r["filename"].lower()
+            if key not in by_name:
+                missing.add(r["filename"])
+                continue
+            name = by_name[key]
+            stem = os.path.splitext(name)[0]
+            if per_file[key] > 1:
+                seen[key] = seen.get(key, 0) + 1
+                out_name = f"{stem}_short_{seen[key]}.mp4"
+            else:
+                out_name = f"{stem}_short.mp4"
+            jobs.append((name, r, out_name))
         for m in sorted(missing):
             print(f"warning: manifest lists '{m}' but it is not in {in_dir}",
                   file=sys.stderr)
-        if not clips:
+        if not jobs:
             die("manifest matched none of the files in --input")
+    else:
+        jobs = [(c, {}, f"{os.path.splitext(c)[0]}_short.mp4") for c in clips]
 
-    print(f"{len(clips)} clip(s), mode={args.mode}, target {OUT_W}x{OUT_H}\n")
+    sources = len({j[0] for j in jobs})
+    print(f"{len(jobs)} Short(s) from {sources} clip(s), mode={args.mode}, "
+          f"target {OUT_W}x{OUT_H}\n")
 
     tmpdir = tempfile.mkdtemp(prefix="mkshorts_")
     ok = 0
     try:
-        for name in clips:
+        for name, row, out_name in jobs:
             src = os.path.join(in_dir, name)
-            stem = os.path.splitext(name)[0]
-            dst = os.path.join(out_dir, f"{stem}_short.mp4")
-            row = manifest.get(name.lower(), {})
+            dst = os.path.join(out_dir, out_name)
             per_clip = row.get("end_card", "")
             if per_clip.lower() in NO_CARD:
                 card = ""
@@ -549,8 +572,8 @@ def main():
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    print(f"\ndone: {ok}/{len(clips)} -> {out_dir}")
-    if ok < len(clips):
+    print(f"\ndone: {ok}/{len(jobs)} -> {out_dir}")
+    if ok < len(jobs):
         sys.exit(1)
 
 
